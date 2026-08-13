@@ -88,6 +88,8 @@ export function calculateRelevanceScore(
   const compactQuery = cleanQuery.replace(/\s+/g, "")
 
   let score = 0
+  let hasExactOrTokenMatch = false
+
   const queryTokens = tokenize(query)
   const titleTokens = tokenize(strippedTitle)
   const fullTitleTokens = tokenize(rawTitle)
@@ -96,15 +98,16 @@ export function calculateRelevanceScore(
   // 1. Exact phrase and prefix matches with word boundaries on cleanTitle
   if (cleanTitle === cleanQuery || compactTitle === compactQuery) {
     score += 1000
+    hasExactOrTokenMatch = true
   } else if (cleanTitle.startsWith(cleanQuery + " ")) {
     score += 500
+    hasExactOrTokenMatch = true
   } else if (
     cleanTitle.includes(` ${cleanQuery} `) ||
     cleanTitle.endsWith(` ${cleanQuery}`)
   ) {
     score += 350
-  } else if (cleanTitle.includes(cleanQuery)) {
-    score += 200
+    hasExactOrTokenMatch = true
   }
 
   // 2. Token Matching & Query Coverage
@@ -122,24 +125,29 @@ export function calculateRelevanceScore(
         if (bestTokenScore < 100) {
           bestTokenScore = 100
           bestPos = i
+          hasExactOrTokenMatch = true
         }
       } else if (tToken.startsWith(qToken) && qToken.length >= 3) {
         const ratio = qToken.length / tToken.length
-        const partialScore = 60 * ratio
-        if (partialScore > bestTokenScore) {
-          bestTokenScore = partialScore
-          bestPos = i
+        if (ratio >= 0.7) {
+          const partialScore = 60 * ratio
+          if (partialScore > bestTokenScore) {
+            bestTokenScore = partialScore
+            bestPos = i
+          }
         }
-      } else if (qToken.startsWith(tToken) && tToken.length >= 3) {
+      } else if (qToken.startsWith(tToken) && tToken.length >= 4) {
         const ratio = tToken.length / qToken.length
-        const partialScore = 50 * ratio
-        if (partialScore > bestTokenScore) {
-          bestTokenScore = partialScore
-          bestPos = i
+        if (ratio >= 0.7) {
+          const partialScore = 50 * ratio
+          if (partialScore > bestTokenScore) {
+            bestTokenScore = partialScore
+            bestPos = i
+          }
         }
       } else if (qToken.length >= 4 && tToken.length >= 4) {
         const dist = levenshtein(qToken, tToken)
-        if (dist === 1) {
+        if (dist === 1 && Math.abs(qToken.length - tToken.length) <= 1) {
           const fuzzyScore = 40
           if (fuzzyScore > bestTokenScore) {
             bestTokenScore = fuzzyScore
@@ -154,6 +162,7 @@ export function calculateRelevanceScore(
       for (const fToken of fullTitleTokens) {
         if (fToken === qToken) {
           bestTokenScore = 100
+          hasExactOrTokenMatch = true
           break
         }
       }
@@ -166,6 +175,11 @@ export function calculateRelevanceScore(
         matchedPositions.push(bestPos)
       }
     }
+  }
+
+  // If not even a single query token matched the title, it is NOT a match -> score 0
+  if (!hasExactOrTokenMatch && matchedTokensCount < 0.5) {
+    return 0
   }
 
   // Query coverage bonus/penalty
@@ -209,13 +223,7 @@ export function calculateRelevanceScore(
   )
   score += density * 50
 
-  // 6. Secondary metadata match (Description / Category)
-  if (item.snippet) {
-    const cleanDesc = normalizeText(item.snippet)
-    if (cleanDesc.includes(cleanQuery)) {
-      score += 25
-    }
-  }
+  // 6. Secondary metadata match (Category)
   if (item.category) {
     const cleanCat = normalizeText(item.category)
     if (cleanCat.includes(cleanQuery)) {
@@ -653,23 +661,33 @@ export const engine = {
         })
       }
 
-      // Sort results based on configured strategy (default: relevance / match coincidence)
-      if (activeSortBy === "relevance") {
-        results.sort((a, b) => {
-          const scoreA = calculateRelevanceScore(query, a)
-          const scoreB = calculateRelevanceScore(query, b)
-          if (scoreB !== scoreA) {
-            return scoreB - scoreA
-          }
-          const seedsA = a.seeders ?? a.seeds ?? 0
-          const seedsB = b.seeders ?? b.seeds ?? 0
-          if (seedsB !== seedsA) {
-            return seedsB - seedsA
-          }
-          const dateA = a.publishDate ? new Date(a.publishDate).getTime() : 0
-          const dateB = b.publishDate ? new Date(b.publishDate).getTime() : 0
-          return dateB - dateA
-        })
+      // Sort and filter results based on configured strategy (default: relevance / match coincidence)
+      if (activeSortBy === "relevance" && query && query.trim()) {
+        const scored = results
+          .map((item) => ({
+            item,
+            score: calculateRelevanceScore(query, item),
+          }))
+          .filter(({ score }) => score > 0)
+          .sort((a, b) => {
+            if (b.score !== a.score) {
+              return b.score - a.score
+            }
+            const seedsA = a.item.seeders ?? a.item.seeds ?? 0
+            const seedsB = b.item.seeders ?? b.item.seeds ?? 0
+            if (seedsB !== seedsA) {
+              return seedsB - seedsA
+            }
+            const dateA = a.item.publishDate
+              ? new Date(a.item.publishDate).getTime()
+              : 0
+            const dateB = b.item.publishDate
+              ? new Date(b.item.publishDate).getTime()
+              : 0
+            return dateB - dateA
+          })
+
+        return scored.map(({ item }) => item)
       } else if (activeSortBy === "seeders") {
         results.sort(
           (a, b) => (b.seeders ?? b.seeds ?? 0) - (a.seeders ?? a.seeds ?? 0)
