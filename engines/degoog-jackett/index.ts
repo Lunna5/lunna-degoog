@@ -5,6 +5,7 @@ export interface JackettConfig {
   apiKey?: string
   indexer?: string
   categories?: string
+  sortBy?: "relevance" | "seeders" | "date" | "none"
 }
 
 let config: JackettConfig = {
@@ -12,6 +13,7 @@ let config: JackettConfig = {
   apiKey: "",
   indexer: "all",
   categories: "",
+  sortBy: "relevance",
 }
 
 function formatBytes(bytes: number | null | undefined, decimals = 2): string {
@@ -22,6 +24,211 @@ function formatBytes(bytes: number | null | undefined, decimals = 2): string {
   const i = Math.floor(Math.log(bytes) / Math.log(k))
   const formatted = parseFloat((bytes / Math.pow(k, i)).toFixed(dm))
   return `${formatted} ${sizes[i] || "B"}`
+}
+
+function normalizeText(text: string): string {
+  return text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function tokenize(text: string): string[] {
+  return normalizeText(text)
+    .split(" ")
+    .filter((t) => t.length > 0)
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0
+  if (!a.length) return b.length
+  if (!b.length) return a.length
+
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    let prev = i
+    for (let j = 1; j <= b.length; j++) {
+      const val =
+        a[i - 1] === b[j - 1]
+          ? row[j - 1]
+          : Math.min(row[j - 1], row[j], prev) + 1
+      row[j - 1] = prev
+      prev = val
+    }
+    row[b.length] = prev
+  }
+  return row[b.length]
+}
+
+export function calculateRelevanceScore(
+  query: string,
+  item: Partial<DegoogTorrentResult>
+): number {
+  if (!query || !query.trim()) {
+    const s = item.seeders ?? item.seeds ?? 0
+    return Math.min(50, Math.log2(s + 1) * 5)
+  }
+
+  const rawTitle = item.title || ""
+  const cleanTitle = normalizeText(rawTitle)
+  const cleanQuery = normalizeText(query)
+  if (!cleanTitle || !cleanQuery) return 0
+
+  const compactTitle = cleanTitle.replace(/\s+/g, "")
+  const compactQuery = cleanQuery.replace(/\s+/g, "")
+
+  let score = 0
+  const queryTokens = tokenize(query)
+  const titleTokens = tokenize(rawTitle)
+  if (queryTokens.length === 0) return 0
+
+  // 1. Exact phrase and prefix matches
+  if (cleanTitle === cleanQuery || compactTitle === compactQuery) {
+    score += 1000
+  } else if (
+    cleanTitle.startsWith(cleanQuery) ||
+    compactTitle.startsWith(compactQuery)
+  ) {
+    score += 500
+  } else if (
+    cleanTitle.includes(` ${cleanQuery} `) ||
+    cleanTitle.endsWith(` ${cleanQuery}`)
+  ) {
+    score += 350
+  } else if (
+    cleanTitle.includes(cleanQuery) ||
+    compactTitle.includes(compactQuery)
+  ) {
+    score += 250
+  }
+
+  // 2. Token Matching & Query Coverage
+  let matchedTokensCount = 0
+  const matchedPositions: number[] = []
+
+  for (const qToken of queryTokens) {
+    let bestTokenScore = 0
+    let bestPos = -1
+
+    for (let i = 0; i < titleTokens.length; i++) {
+      const tToken = titleTokens[i]
+      if (tToken === qToken) {
+        if (bestTokenScore < 100) {
+          bestTokenScore = 100
+          bestPos = i
+        }
+      } else if (tToken.startsWith(qToken) || qToken.startsWith(tToken)) {
+        const ratio =
+          Math.min(tToken.length, qToken.length) /
+          Math.max(tToken.length, qToken.length)
+        const partialScore = 70 * ratio
+        if (partialScore > bestTokenScore) {
+          bestTokenScore = partialScore
+          bestPos = i
+        }
+      } else if (tToken.includes(qToken)) {
+        const partialScore = 50 * (qToken.length / tToken.length)
+        if (partialScore > bestTokenScore) {
+          bestTokenScore = partialScore
+          bestPos = i
+        }
+      } else if (qToken.length >= 4 && tToken.length >= 4) {
+        const dist = levenshtein(qToken, tToken)
+        if (dist === 1) {
+          const fuzzyScore = 40
+          if (fuzzyScore > bestTokenScore) {
+            bestTokenScore = fuzzyScore
+            bestPos = i
+          }
+        }
+      }
+    }
+
+    // Check if token matches compact title (handles words with hyphens/dots without spaces)
+    if (
+      bestTokenScore < 90 &&
+      qToken.length >= 3 &&
+      compactTitle.includes(qToken)
+    ) {
+      bestTokenScore = 90
+      if (bestPos === -1) bestPos = 0
+    }
+
+    if (bestTokenScore > 0) {
+      matchedTokensCount += bestTokenScore / 100
+      score += bestTokenScore
+      if (bestPos !== -1) {
+        matchedPositions.push(bestPos)
+      }
+    }
+  }
+
+  // Query coverage bonus/penalty
+  const coverage = matchedTokensCount / queryTokens.length
+  if (coverage >= 0.99) {
+    score += 300
+  } else {
+    score *= Math.pow(coverage, 1.5)
+  }
+
+  // 3. Proximity and order of matches
+  if (matchedPositions.length > 1) {
+    let inOrder = true
+    for (let i = 1; i < matchedPositions.length; i++) {
+      if (matchedPositions[i] <= matchedPositions[i - 1]) {
+        inOrder = false
+        break
+      }
+    }
+    if (inOrder) {
+      score += 80
+    }
+    const span =
+      matchedPositions[matchedPositions.length - 1] - matchedPositions[0] + 1
+    if (span <= queryTokens.length + 2) {
+      score += 70
+    }
+  }
+
+  // 4. Earliest match bonus (matches at the beginning of the title score higher)
+  if (matchedPositions.length > 0) {
+    const firstPos = matchedPositions[0]
+    const posBonus = Math.max(0, 60 - firstPos * 12)
+    score += posBonus
+  }
+
+  // 5. Query Density (concise, focused titles beat spammy long titles)
+  const density = Math.min(
+    1,
+    cleanQuery.length / Math.max(cleanQuery.length, cleanTitle.length)
+  )
+  score += density * 50
+
+  // 6. Secondary metadata match (Description / Category)
+  if (item.snippet) {
+    const cleanDesc = normalizeText(item.snippet)
+    if (cleanDesc.includes(cleanQuery)) {
+      score += 25
+    }
+  }
+  if (item.category) {
+    const cleanCat = normalizeText(item.category)
+    if (cleanCat.includes(cleanQuery)) {
+      score += 15
+    }
+  }
+
+  // 7. Seeders tie-breaker (logarithmic so it breaks ties without overpowering relevance)
+  const seeders = item.seeders ?? item.seeds ?? 0
+  if (seeders > 0) {
+    const seederBonus = Math.min(30, Math.log2(seeders + 1) * 3)
+    score += seederBonus
+  }
+
+  return score
 }
 
 function matchesTimeFilter(
@@ -171,6 +378,14 @@ export const engine = {
       default: "",
       description: "Comma-separated Torznab category IDs (e.g. 2000,5000) or leave blank",
     },
+    {
+      key: "sortBy",
+      label: "Sort Results By",
+      type: "text",
+      required: false,
+      default: "relevance",
+      description: "Sorting strategy: 'relevance' (best match first), 'seeders', 'date', or 'none'",
+    },
   ],
 
   configure(settings?: Partial<JackettConfig>) {
@@ -186,6 +401,9 @@ export const engine = {
     }
     if (settings.categories !== undefined) {
       config.categories = settings.categories.trim()
+    }
+    if (settings.sortBy !== undefined) {
+      config.sortBy = settings.sortBy
     }
   },
 
@@ -236,6 +454,8 @@ export const engine = {
       config.categories ??
       ""
     ).trim()
+    const activeSortBy =
+      context?.settings?.sortBy || config.sortBy || "relevance"
 
     if (!activeApiKey) {
       if (context?.engineError) {
@@ -271,7 +491,7 @@ export const engine = {
       }
 
       // Pagination parameters for Jackett Torznab API
-      const pageSize = 30
+      const pageSize = 50
       const offset = Math.max(0, (page - 1) * pageSize)
       searchUrl.searchParams.set("offset", String(offset))
       searchUrl.searchParams.set("limit", String(pageSize))
@@ -428,6 +648,35 @@ export const engine = {
           files: item.Files ?? undefined,
           grabs: item.Grabs ?? undefined,
           infoHash: item.InfoHash || undefined,
+        })
+      }
+
+      // Sort results based on configured strategy (default: relevance / match coincidence)
+      if (activeSortBy === "relevance") {
+        results.sort((a, b) => {
+          const scoreA = calculateRelevanceScore(query, a)
+          const scoreB = calculateRelevanceScore(query, b)
+          if (scoreB !== scoreA) {
+            return scoreB - scoreA
+          }
+          const seedsA = a.seeders ?? a.seeds ?? 0
+          const seedsB = b.seeders ?? b.seeds ?? 0
+          if (seedsB !== seedsA) {
+            return seedsB - seedsA
+          }
+          const dateA = a.publishDate ? new Date(a.publishDate).getTime() : 0
+          const dateB = b.publishDate ? new Date(b.publishDate).getTime() : 0
+          return dateB - dateA
+        })
+      } else if (activeSortBy === "seeders") {
+        results.sort(
+          (a, b) => (b.seeders ?? b.seeds ?? 0) - (a.seeders ?? a.seeds ?? 0)
+        )
+      } else if (activeSortBy === "date") {
+        results.sort((a, b) => {
+          const dateA = a.publishDate ? new Date(a.publishDate).getTime() : 0
+          const dateB = b.publishDate ? new Date(b.publishDate).getTime() : 0
+          return dateB - dateA
         })
       }
 

@@ -4,6 +4,7 @@ A custom search engine extension for **degoog** to search torrents and media acr
 
 ## Features
 
+- **Match Relevance Ranking**: Automatically scores and ranks results by title/query similarity (exact match, token coverage, proximity, and density) so the most accurate results appear at the top.
 - **Jackett API v2.0 Integration**: Queries all indexers or a specific configured indexer.
 - **Rich Torrent Metadata**: Parses seeders, peers/leechers, human-readable file size, tracker name, category, publish date, and magnet/download links.
 - **Time & Date Filtering**: Filters results by time period (day, week, month, year) or specific date range.
@@ -20,6 +21,7 @@ In the degoog settings panel for **degoog-jackett**, configure the following opt
 | **API Key** (`apiKey`) | Password | Yes | — | Your Jackett API key (found in the top right of the Jackett web UI). |
 | **Indexer** (`indexer`) | Text | No | `all` | Specific indexer ID (e.g. `1337x`, `yts`) or `all` to search all configured indexers. |
 | **Categories** (`categories`) | Text | No | `""` | Comma-separated Torznab category IDs (e.g. `2000,5000` for Movies and TV). |
+| **Sort By** (`sortBy`) | Text | No | `relevance` | Sort order: `relevance` (highest match first), `seeders`, `date`, or `none`. |
 
 ## Usage
 
