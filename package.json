@@ -10,7 +10,7 @@
       "path": "engines/degoog-jackett",
       "name": "degoog-jackett",
       "description": "Jackett torrent search engine for degoog",
-      "version": "1.0.2"
+      "version": "1.0.3"
     }
   ],
   "transports": [],

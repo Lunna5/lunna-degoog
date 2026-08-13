@@ -63,6 +63,11 @@ function levenshtein(a: string, b: string): number {
   return row[b.length]
 }
 
+function stripBrackets(text: string): string {
+  const stripped = text.replace(/\[[^\]]*\]/g, " ").trim()
+  return stripped.length > 0 ? stripped : text.replace(/[\[\]]/g, " ")
+}
+
 export function calculateRelevanceScore(
   query: string,
   item: Partial<DegoogTorrentResult>
@@ -73,7 +78,9 @@ export function calculateRelevanceScore(
   }
 
   const rawTitle = item.title || ""
-  const cleanTitle = normalizeText(rawTitle)
+  // Strip bracketed content [...] so release group names / tags do not falsely match search terms
+  const strippedTitle = stripBrackets(rawTitle)
+  const cleanTitle = normalizeText(strippedTitle)
   const cleanQuery = normalizeText(query)
   if (!cleanTitle || !cleanQuery) return 0
 
@@ -82,27 +89,22 @@ export function calculateRelevanceScore(
 
   let score = 0
   const queryTokens = tokenize(query)
-  const titleTokens = tokenize(rawTitle)
+  const titleTokens = tokenize(strippedTitle)
+  const fullTitleTokens = tokenize(rawTitle)
   if (queryTokens.length === 0) return 0
 
-  // 1. Exact phrase and prefix matches
+  // 1. Exact phrase and prefix matches with word boundaries on cleanTitle
   if (cleanTitle === cleanQuery || compactTitle === compactQuery) {
     score += 1000
-  } else if (
-    cleanTitle.startsWith(cleanQuery) ||
-    compactTitle.startsWith(compactQuery)
-  ) {
+  } else if (cleanTitle.startsWith(cleanQuery + " ")) {
     score += 500
   } else if (
     cleanTitle.includes(` ${cleanQuery} `) ||
     cleanTitle.endsWith(` ${cleanQuery}`)
   ) {
     score += 350
-  } else if (
-    cleanTitle.includes(cleanQuery) ||
-    compactTitle.includes(compactQuery)
-  ) {
-    score += 250
+  } else if (cleanTitle.includes(cleanQuery)) {
+    score += 200
   }
 
   // 2. Token Matching & Query Coverage
@@ -113,6 +115,7 @@ export function calculateRelevanceScore(
     let bestTokenScore = 0
     let bestPos = -1
 
+    // First check core stripped title tokens (higher priority for title matching)
     for (let i = 0; i < titleTokens.length; i++) {
       const tToken = titleTokens[i]
       if (tToken === qToken) {
@@ -120,17 +123,16 @@ export function calculateRelevanceScore(
           bestTokenScore = 100
           bestPos = i
         }
-      } else if (tToken.startsWith(qToken) || qToken.startsWith(tToken)) {
-        const ratio =
-          Math.min(tToken.length, qToken.length) /
-          Math.max(tToken.length, qToken.length)
-        const partialScore = 70 * ratio
+      } else if (tToken.startsWith(qToken) && qToken.length >= 3) {
+        const ratio = qToken.length / tToken.length
+        const partialScore = 60 * ratio
         if (partialScore > bestTokenScore) {
           bestTokenScore = partialScore
           bestPos = i
         }
-      } else if (tToken.includes(qToken)) {
-        const partialScore = 50 * (qToken.length / tToken.length)
+      } else if (qToken.startsWith(tToken) && tToken.length >= 3) {
+        const ratio = tToken.length / qToken.length
+        const partialScore = 50 * ratio
         if (partialScore > bestTokenScore) {
           bestTokenScore = partialScore
           bestPos = i
@@ -147,14 +149,14 @@ export function calculateRelevanceScore(
       }
     }
 
-    // Check if token matches compact title (handles words with hyphens/dots without spaces)
-    if (
-      bestTokenScore < 90 &&
-      qToken.length >= 3 &&
-      compactTitle.includes(qToken)
-    ) {
-      bestTokenScore = 90
-      if (bestPos === -1) bestPos = 0
+    // If not found in core title, check if it was an exact tag token inside brackets (e.g. 1080p, 720p)
+    if (bestTokenScore < 100) {
+      for (const fToken of fullTitleTokens) {
+        if (fToken === qToken) {
+          bestTokenScore = 100
+          break
+        }
+      }
     }
 
     if (bestTokenScore > 0) {
@@ -171,7 +173,7 @@ export function calculateRelevanceScore(
   if (coverage >= 0.99) {
     score += 300
   } else {
-    score *= Math.pow(coverage, 1.5)
+    score *= Math.pow(coverage, 2)
   }
 
   // 3. Proximity and order of matches
@@ -193,14 +195,14 @@ export function calculateRelevanceScore(
     }
   }
 
-  // 4. Earliest match bonus (matches at the beginning of the title score higher)
+  // 4. Earliest match bonus (matches at the beginning of the core title score higher)
   if (matchedPositions.length > 0) {
     const firstPos = matchedPositions[0]
     const posBonus = Math.max(0, 60 - firstPos * 12)
     score += posBonus
   }
 
-  // 5. Query Density (concise, focused titles beat spammy long titles)
+  // 5. Query Density based on core title
   const density = Math.min(
     1,
     cleanQuery.length / Math.max(cleanQuery.length, cleanTitle.length)
